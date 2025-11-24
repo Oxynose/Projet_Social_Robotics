@@ -1,0 +1,12 @@
+name: car_racing_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - gymnasium==0.29.1
+      - Box2D==2.3.10
+      - pygame
+      - numpy
+      - matplotlib
