@@ -1,6 +1,10 @@
 # Projet_Social_Robotics
 
-## Installation
+Pour entraîner l'agent:
+python main.py --train
 
-Pour l'installation de CarRacing-v3 sous environnement `conda`:
-- Aller voir le `INSTALL.md`
+Pour tester le modèle :
+python main.py --play
+
+Sinon pour juste jouer au RaicingCar :
+python main.py
