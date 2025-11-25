@@ -1,10 +1,9 @@
 # models/gail_agent.py
 import os
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.distributions import Categorical
+from torch.nn import functional as F
 
 from models.ppo_agent import PPOAgent, ACTIONS, N_ACTIONS
 
@@ -27,6 +26,7 @@ class Discriminator(nn.Module):
             nn.Flatten()
         )
 
+        # calcul taille sortie conv
         with torch.no_grad():
             dummy = torch.zeros(1, c, h, w)
             conv_out = self.conv(dummy).shape[1]
@@ -35,7 +35,7 @@ class Discriminator(nn.Module):
             nn.Linear(conv_out + n_actions, 256),
             nn.ReLU(),
             nn.Linear(256, 1),
-            nn.Sigmoid()      # prob(expert)
+            nn.Sigmoid()      # probabilité que l'action vienne d'un expert
         )
 
     def forward(self, obs, action_oh):
@@ -64,24 +64,28 @@ class GAILAgent:
     # Reward from Discriminator
     # -----------------------------
     def compute_gail_reward(self, obs, actions):
-        actions_onehot = torch.nn.functional.one_hot(actions, N_ACTIONS).float()
+        obs = obs.to(self.device)
+        actions = actions.to(self.device)
+        actions_onehot = F.one_hot(actions, N_ACTIONS).float()
         d_out = self.disc(obs, actions_onehot)
         reward = -torch.log(1 - d_out + 1e-8)
-        return reward.squeeze(-1)
+        # S'assurer que la forme est (batch,)
+        return reward.view(-1)
 
     # -----------------------------
     # Update Discriminator
     # -----------------------------
     def update_discriminator(self, expert_obs, expert_actions, policy_obs, policy_actions, epochs=3):
+        # Conversion vers tensors et device
         expert_obs = torch.tensor(expert_obs, dtype=torch.float32, device=self.device)
         expert_actions = torch.tensor(expert_actions, dtype=torch.long, device=self.device)
-
         policy_obs = torch.tensor(policy_obs, dtype=torch.float32, device=self.device)
         policy_actions = torch.tensor(policy_actions, dtype=torch.long, device=self.device)
 
+        last_loss = None
         for _ in range(epochs):
-            exp_oh = torch.nn.functional.one_hot(expert_actions, N_ACTIONS).float()
-            pol_oh = torch.nn.functional.one_hot(policy_actions, N_ACTIONS).float()
+            exp_oh = F.one_hot(expert_actions, N_ACTIONS).float()
+            pol_oh = F.one_hot(policy_actions, N_ACTIONS).float()
 
             d_exp = self.disc(expert_obs, exp_oh)
             d_pol = self.disc(policy_obs, pol_oh)
@@ -92,7 +96,10 @@ class GAILAgent:
             loss.backward()
             self.opt_disc.step()
 
-            print(f"[GAIL] Discriminator loss: {loss.item():.4f}")
+            last_loss = loss.item()
+            print(f"[GAIL] Discriminator loss: {last_loss:.4f}")
+
+        return last_loss
 
     # -----------------------------
     # Update policy using PPO
@@ -108,9 +115,10 @@ class GAILAgent:
             minibatch_size=64
         )
         print(f"[GAIL] PPO policy loss: {loss:.4f}")
+        return loss
 
     # -----------------------------
-    # Save policy
+    # Save policy + discriminator
     # -----------------------------
     def save(self, path):
         dirpath = os.path.dirname(path)
@@ -121,8 +129,13 @@ class GAILAgent:
             "policy": self.policy.net.state_dict(),
             "discriminator": self.disc.state_dict()
         }, path)
+        print(f"[GAIL] Modèle sauvegardé dans : {path}")
 
+    # -----------------------------
+    # Load policy + discriminator
+    # -----------------------------
     def load(self, path):
         data = torch.load(path, map_location=self.device)
         self.policy.net.load_state_dict(data["policy"])
         self.disc.load_state_dict(data["discriminator"])
+        print(f"[GAIL] Modèle chargé depuis : {path}")

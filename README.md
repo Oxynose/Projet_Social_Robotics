@@ -15,8 +15,9 @@ python main.py --ppo --play
 
 Pour entraîner/tester l'agent gail:
 ```bash
-python main.py --gail --train
-python main.py --gail --play
+python main.py --gail --train        !!! Attention, l'entraînement de l'agent GAIL est très gourmant en ressource, 
+python main.py --gail --play         il peut donc entraîner de fort ralentissements sur votre ordinateur 
+                                     s'il n'est pas assez puissant
 ```
 
 Sinon pour juste lancer RaicingCar :
