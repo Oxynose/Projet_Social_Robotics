@@ -1,4 +1,3 @@
-# main.py
 import argparse
 import os
 import time
@@ -10,6 +9,7 @@ import pygame
 import torch
 
 from models.ppo_agent import PPOAgent, ACTIONS
+from models.gail_agent import GAILAgent
 
 # Key bindings (AZERTY)
 STEER_LEFT = pygame.K_q
@@ -19,6 +19,7 @@ BRAKE = pygame.K_s
 QUIT_KEY = pygame.K_ESCAPE
 
 MODEL_PATH_PPO = "ppo_carracing.pth"
+MODEL_PATH_GAIL = "gail_carracing.pth"
 
 
 # ------------------------------------------
@@ -41,6 +42,9 @@ def get_discrete_action(keys):
     return 0
 
 
+# ---------------------------
+# PLAY KEYBOARD
+# ---------------------------
 def play_with_keyboard():
     pygame.init()
     pygame.display.set_caption("CarRacing Discrete Controls (ZQSD)")
@@ -202,24 +206,183 @@ def train_ppo(total_timesteps=200_000, rollout_steps=2048, update_epochs=8, mini
     print("PPO training complete. Saved to:", save_path)
 
 
-# ---------------------------
-# CLI
-# ---------------------------
+# ==========================================================
+#                      GAIL TRAIN
+# ==========================================================
+def train_gail(save_path=MODEL_PATH_GAIL, max_demos=5):
+
+    # ------------ DEMONSTRATIONS ------------
+    env = gym.make("CarRacing-v2", render_mode="human")
+    obs, info = env.reset()
+    obs_shape = (3, obs.shape[0], obs.shape[1])
+
+    agent = GAILAgent(obs_shape)
+
+    demonstrations_obs = []
+    demonstrations_actions = []
+
+    print("\n===== COLLECTE DES DÉMONSTRATIONS HUMAINES =====")
+
+    pygame.init()
+    clock = pygame.time.Clock()
+
+    demos = 0
+    ep_obs, ep_act = [], []
+
+    while demos < max_demos:
+        clock.tick(60)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                exit()
+
+        keys = pygame.key.get_pressed()
+        action_id = get_discrete_action(keys)
+        action = ACTIONS[action_id]
+
+        obs_chw = np.transpose(obs, (2, 0, 1)).astype(np.float32)
+        ep_obs.append(obs_chw)
+        ep_act.append(action_id)
+
+        obs, reward, term, trunc, info = env.step(action)
+
+        if term or trunc:
+            demonstrations_obs.extend(ep_obs)
+            demonstrations_actions.extend(ep_act)
+            ep_obs, ep_act = [], []
+            demos += 1
+            print(f"Démonstration {demos}/{max_demos} enregistrée.")
+            obs, info = env.reset()
+
+    env.close()
+    pygame.quit()
+
+    expert_obs = np.array(demonstrations_obs, dtype=np.float32)
+    expert_actions = np.array(demonstrations_actions, dtype=np.int64)
+
+    print("\n===== ENTRAÎNEMENT GAIL =====")
+
+    # ------------ GENERATE FAKE DATA ------------
+    env = gym.make("CarRacing-v2", render_mode=None)
+    obs, _ = env.reset()
+
+    fake_obs = []
+    fake_actions = []
+
+    for _ in range(len(expert_obs)):
+        obs_chw = np.transpose(obs, (2, 0, 1)).astype(np.float32)
+        a, _, _ = agent.policy.act(obs_chw)
+        fake_obs.append(obs_chw)
+        fake_actions.append(a)
+
+        obs, _, term, trunc, _ = env.step(ACTIONS[a])
+        if term or trunc:
+            obs, _ = env.reset()
+
+    fake_obs = np.array(fake_obs, dtype=np.float32)
+    fake_actions = np.array(fake_actions, dtype=np.int64)
+
+    # ------------ UPDATE DISCRIMINATOR ------------
+    agent.update_discriminator(
+        expert_obs, expert_actions,
+        fake_obs, fake_actions
+    )
+
+    # ------------ COMPUTE GAIL REWARDS ------------
+    device = agent.device
+    t_obs = torch.tensor(fake_obs, dtype=torch.float32, device=device)
+    t_act = torch.tensor(fake_actions, dtype=torch.long, device=device)
+
+    gail_rewards = agent.compute_gail_reward(t_obs, t_act).detach().cpu().numpy()
+    print(f"[GAIL] Mean GAIL reward: {gail_rewards.mean():.4f}")
+
+    # ------------ GET LOGPROBS + VALUES FOR PPO ------------
+    logps = []
+    values = []
+    for o in fake_obs:
+        a, lp, v = agent.policy.act(o)
+        logps.append(lp)
+        values.append(v)
+
+    logps = np.array(logps)
+    values = np.array(values)
+
+    # ------------ UPDATE POLICY (PPO) ------------
+    agent.update_policy(
+        obs=fake_obs,
+        actions=fake_actions,
+        logprobs_old=logps,
+        values=values,
+        rewards=gail_rewards
+    )
+
+    agent.save(save_path)
+    print("\nModèle GAIL sauvegardé dans :", save_path)
+
+
+# ==========================================================
+#                      GAIL PLAY
+# ==========================================================
+def play_gail(model_path=MODEL_PATH_GAIL):
+    env = gym.make("CarRacing-v2", render_mode="human")
+    obs, info = env.reset()
+
+    obs_shape = (3, obs.shape[0], obs.shape[1])
+    agent = GAILAgent(obs_shape)
+
+    if not os.path.exists(model_path):
+        print(f"Model '{model_path}' introuvable.")
+        return
+
+    agent.load(model_path)
+    print("Modèle GAIL chargé. Jeu en cours...")
+
+    total_reward = 0
+
+    while True:
+        obs_chw = np.transpose(obs, (2, 0, 1)).astype(np.float32)
+        action_id, _, _ = agent.policy.act(obs_chw)
+        obs, r, term, trunc, _ = env.step(ACTIONS[action_id])
+        total_reward += r
+
+        if term or trunc:
+            print("Épisode terminé – reward =", total_reward)
+            total_reward = 0
+            obs, info = env.reset()
+
+
+# ==========================================================
+#                          CLI
+# ==========================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ppo", action="store_true")
+    parser.add_argument("--gail", action="store_true")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--play", action="store_true")
     parser.add_argument("--model", type=str, default=None)
 
     args = parser.parse_args()
 
-    model_path = args.model or MODEL_PATH_PPO
+    if args.model:
+        model_path = args.model
+    else:
+        model_path = MODEL_PATH_PPO if args.ppo else MODEL_PATH_GAIL
 
-    if args.train:
+    # PPO
+    if args.ppo and args.train:
         train_ppo(save_path=model_path)
 
-    elif args.play:
+    elif args.ppo and args.play:
         play_ppo(model_path)
 
+    # GAIL
+    elif args.gail and args.train:
+        train_gail(save_path=model_path)
+
+    elif args.gail and args.play:
+        play_gail(model_path)
+
+    # Keyboard
     else:
         play_with_keyboard()

@@ -160,6 +160,7 @@ class PPOAgent:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+        return loss.item()
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
