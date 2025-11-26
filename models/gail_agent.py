@@ -7,7 +7,6 @@ from torch.nn import functional as F
 
 from models.ppo_agent import PPOAgent, ACTIONS, N_ACTIONS
 
-
 # ----------------------------------------------------
 # Discriminateur (CNN + MLP)
 # ----------------------------------------------------
@@ -26,7 +25,6 @@ class Discriminator(nn.Module):
             nn.Flatten()
         )
 
-        # calcul taille sortie conv
         with torch.no_grad():
             dummy = torch.zeros(1, c, h, w)
             conv_out = self.conv(dummy).shape[1]
@@ -35,7 +33,7 @@ class Discriminator(nn.Module):
             nn.Linear(conv_out + n_actions, 256),
             nn.ReLU(),
             nn.Linear(256, 1),
-            nn.Sigmoid()      # probabilité que l'action vienne d'un expert
+            nn.Sigmoid()  # probabilité que l'action vienne d'un expert
         )
 
     def forward(self, obs, action_oh):
@@ -61,22 +59,34 @@ class GAILAgent:
         self.opt_disc = Adam(self.disc.parameters(), lr=lr_disc)
 
     # -----------------------------
-    # Reward from Discriminator
+    # Reward from Discriminator + SPEED BONUS
     # -----------------------------
-    def compute_gail_reward(self, obs, actions):
+    def compute_gail_reward(self, obs, actions, speed=None):
+        """
+        obs: tensor (batch, C, H, W)
+        actions: tensor (batch,)
+        speed: tensor (batch,) optionnel
+        """
         obs = obs.to(self.device)
         actions = actions.to(self.device)
         actions_onehot = F.one_hot(actions, N_ACTIONS).float()
         d_out = self.disc(obs, actions_onehot)
-        reward = -torch.log(1 - d_out + 1e-8)
-        # S'assurer que la forme est (batch,)
-        return reward.view(-1)
+
+        # Reward GAIL classique
+        reward = -torch.log(1 - d_out + 1e-8).squeeze(-1)  # <-- squeeze pour garder shape (batch,)
+
+        # Bonus vitesse
+        if speed is not None:
+            speed = speed.to(self.device)
+            reward = reward + 0.7 * speed  # bonus vitesse
+
+        return reward  # shape (batch,)
 
     # -----------------------------
     # Update Discriminator
     # -----------------------------
-    def update_discriminator(self, expert_obs, expert_actions, policy_obs, policy_actions, epochs=3):
-        # Conversion vers tensors et device
+    def update_discriminator(self, expert_obs, expert_actions, expert_speed,
+                             policy_obs, policy_actions, policy_speed, epochs=3):
         expert_obs = torch.tensor(expert_obs, dtype=torch.float32, device=self.device)
         expert_actions = torch.tensor(expert_actions, dtype=torch.long, device=self.device)
         policy_obs = torch.tensor(policy_obs, dtype=torch.float32, device=self.device)

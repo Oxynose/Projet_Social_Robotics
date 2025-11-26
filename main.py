@@ -1,3 +1,4 @@
+# main.py
 import argparse
 import os
 import time
@@ -21,7 +22,6 @@ QUIT_KEY = pygame.K_ESCAPE
 MODEL_PATH_PPO = "ppo_carracing.pth"
 MODEL_PATH_GAIL = "gail_carracing.pth"
 
-
 # ------------------------------------------
 #  Discrete keyboard → continuous actions
 # ------------------------------------------
@@ -40,7 +40,6 @@ def get_discrete_action(keys):
     if gas: return 3
     if brake: return 4
     return 0
-
 
 # ---------------------------
 # PLAY KEYBOARD
@@ -72,7 +71,6 @@ def play_with_keyboard():
 
     env.close()
     pygame.quit()
-
 
 # ---------------------------
 # PPO — PLAY
@@ -106,12 +104,10 @@ def play_ppo(model_path):
             total_reward = 0.0
             obs, info = env.reset()
 
-
 # ---------------------------
 # PPO — TRAIN
 # ---------------------------
-def train_ppo(total_timesteps=200_000, rollout_steps=2048, update_epochs=8, minibatch_size=64, save_path=MODEL_PATH_PPO):
-
+def train_ppo(total_timesteps=100000, rollout_steps=2048, update_epochs=8, minibatch_size=32, save_path=MODEL_PATH_PPO):
     env = gym.make("CarRacing-v2", render_mode=None)
     obs, info = env.reset()
 
@@ -120,12 +116,7 @@ def train_ppo(total_timesteps=200_000, rollout_steps=2048, update_epochs=8, mini
     device = agent.device
 
     # Rollout buffers
-    obs_buffer = []
-    actions_buffer = []
-    logprobs_buffer = []
-    rewards_buffer = []
-    dones_buffer = []
-    values_buffer = []
+    obs_buffer, actions_buffer, logprobs_buffer, rewards_buffer, dones_buffer, values_buffer = [], [], [], [], [], []
 
     timestep = 0
     episode_rewards = deque(maxlen=100)
@@ -154,7 +145,6 @@ def train_ppo(total_timesteps=200_000, rollout_steps=2048, update_epochs=8, mini
 
             ep_reward += reward
             timestep += 1
-
             obs = next_obs
             obs_chw = np.transpose(next_obs, (2, 0, 1)).astype(np.float32)
 
@@ -205,30 +195,23 @@ def train_ppo(total_timesteps=200_000, rollout_steps=2048, update_epochs=8, mini
     env.close()
     print("PPO training complete. Saved to:", save_path)
 
-
 # ==========================================================
 #                      GAIL TRAIN
 # ==========================================================
-def train_gail(save_path=MODEL_PATH_GAIL, 
-               max_demos=20,                   #demos 50, gail_epochs 50, d_s 5, max_fake_steps 2048
-               gail_epochs=50,
-               discriminator_steps=5, 
-               max_fake_steps=2048):
-
-    # ------------ COLLECTE DES DÉMONSTRATIONS ------------
+def train_gail(save_path=MODEL_PATH_GAIL, max_demos=30, gail_epochs=50, discriminator_steps=5, max_fake_steps=2048):
+    # Collecte des démonstrations
     env = gym.make("CarRacing-v2", render_mode="human")
     obs, info = env.reset()
     obs_shape = (3, obs.shape[0], obs.shape[1])
     agent = GAILAgent(obs_shape)
 
-    demonstrations_obs = []
-    demonstrations_actions = []
+    demonstrations_obs, demonstrations_actions, demonstrations_speed = [], [], []
 
     print("\n===== COLLECTE DES DÉMONSTRATIONS HUMAINES =====")
     pygame.init()
     clock = pygame.time.Clock()
     demos = 0
-    ep_obs, ep_act = [], []
+    ep_obs, ep_act, ep_speed = [], [], []
 
     while demos < max_demos:
         clock.tick(60)
@@ -241,11 +224,12 @@ def train_gail(save_path=MODEL_PATH_GAIL,
         action = ACTIONS[action_id]
 
         obs_chw = np.transpose(obs, (2, 0, 1)).astype(np.float32)
+        speed = info.get("speed", 0.0)  # vitesse actuelle
         ep_obs.append(obs_chw)
         ep_act.append(action_id)
+        ep_speed.append(speed)
 
         obs, reward, term, trunc, info = env.step(action)
-
         total_tiles = info.get("all_tiles", 0)
         visited_tiles = info.get("tiles", 0)
         if total_tiles > 0:
@@ -257,11 +241,12 @@ def train_gail(save_path=MODEL_PATH_GAIL,
             if visited_tiles >= total_tiles:
                 demonstrations_obs.extend(ep_obs)
                 demonstrations_actions.extend(ep_act)
+                demonstrations_speed.extend(ep_speed)
                 demos += 1
                 print(f"Démonstration {demos}/{max_demos} enregistrée (parcours complet).")
             else:
                 print("Épisode incomplet, démonstration ignorée.")
-            ep_obs, ep_act = [], []
+            ep_obs, ep_act, ep_speed = [], [], []
             obs, info = env.reset()
 
     env.close()
@@ -269,60 +254,59 @@ def train_gail(save_path=MODEL_PATH_GAIL,
 
     expert_obs = np.array(demonstrations_obs, dtype=np.float32)
     expert_actions = np.array(demonstrations_actions, dtype=np.int64)
+    expert_speed = np.array(demonstrations_speed, dtype=np.float32)
 
     # ------------ ENTRAÎNEMENT GAIL ------------
     print("\n===== ENTRAÎNEMENT GAIL EN COURS... =====")
     env = gym.make("CarRacing-v2", render_mode=None)
-    obs, _ = env.reset()
+    obs, info = env.reset()
 
     for epoch in range(1, gail_epochs + 1):
-        fake_obs, fake_actions = [], []
+        fake_obs, fake_actions, fake_speed, logps, values = [], [], [], [], []
 
-        # Générer trajectoires fake (limité à max_fake_steps)
-        num_steps = min(max_fake_steps, len(expert_obs))
-        for i in range(num_steps):
+        step_count = 0
+        while step_count < max_fake_steps:
             obs_chw = np.transpose(obs, (2, 0, 1)).astype(np.float32)
-            a, _, _ = agent.policy.act(obs_chw)
+            a, lp, v = agent.policy.act(obs_chw)
+            speed = info.get("speed", 0.0)
+
             fake_obs.append(obs_chw)
             fake_actions.append(a)
-
-            obs, _, term, trunc, _ = env.step(ACTIONS[a])
-            if term or trunc:
-                obs, _ = env.reset()
-
-            if i % 100 == 0 or i == num_steps - 1:
-                print(f"\r[Epoch {epoch}] Generating fake trajectories: step {i+1}/{num_steps}", end="")
-
-        print()  # fin de ligne pour la progression
-
-        fake_obs = np.array(fake_obs, dtype=np.float32)
-        fake_actions = np.array(fake_actions, dtype=np.int64)
-
-        # Mise à jour du discriminateur
-        for step in range(discriminator_steps):
-            d_loss = agent.update_discriminator(expert_obs, expert_actions, fake_obs, fake_actions)
-            print(f"[Epoch {epoch}] Discriminator step {step+1}/{discriminator_steps}, loss: {d_loss:.4f}")
-
-        # Calcul des récompenses GAIL
-        t_obs = torch.tensor(fake_obs, dtype=torch.float32, device=agent.device)
-        t_act = torch.tensor(fake_actions, dtype=torch.long, device=agent.device)
-        gail_rewards = agent.compute_gail_reward(t_obs, t_act).detach().cpu().numpy()
-        print(f"[Epoch {epoch}] Mean GAIL reward: {gail_rewards.mean():.4f}")
-
-        # Logprobs + values pour PPO
-        logps, values = [], []
-        for o in fake_obs:
-            a, lp, v = agent.policy.act(o)
+            fake_speed.append(speed)
             logps.append(lp)
             values.append(v)
+
+            obs, _, term, trunc, info = env.step(ACTIONS[a])
+            step_count += 1
+
+            if term or trunc:
+                obs, info = env.reset()
+
+            if step_count % 100 == 0 or step_count == max_fake_steps:
+                print(f"\r[Epoch {epoch}] Generating fake trajectories: step {step_count}/{max_fake_steps}", end="")
+
+        print()
+
+        # Conversion en numpy / tensor
+        t_obs = torch.tensor(fake_obs, dtype=torch.float32, device=agent.device)
+        t_act = torch.tensor(fake_actions, dtype=torch.long, device=agent.device)
+        t_speed = torch.tensor(fake_speed, dtype=torch.float32, device=agent.device)
+        gail_rewards = agent.compute_gail_reward(t_obs, t_act, speed=t_speed).detach().cpu().numpy()
 
         logps = np.array(logps)
         values = np.array(values)
 
-        # Mise à jour de la politique PPO
-        agent.update_policy(obs=fake_obs, actions=fake_actions, logprobs_old=logps, values=values, rewards=gail_rewards)
+        # Mise à jour du discriminateur
+        for step in range(discriminator_steps):
+            d_loss = agent.update_discriminator(expert_obs, expert_actions, expert_speed,
+                                               fake_obs, fake_actions, fake_speed)
+            print(f"[Epoch {epoch}] Discriminator step {step+1}/{discriminator_steps}, loss: {d_loss:.4f}")
 
-        # Sauvegarde du modèle à chaque epoch
+        # Mise à jour de la politique PPO
+        agent.update_policy(obs=fake_obs, actions=fake_actions,
+                            logprobs_old=logps, values=values, rewards=gail_rewards)
+
+        # Sauvegarde
         agent.save(save_path)
 
     env.close()
@@ -350,14 +334,13 @@ def play_gail(model_path=MODEL_PATH_GAIL):
     while True:
         obs_chw = np.transpose(obs, (2, 0, 1)).astype(np.float32)
         action_id, _, _ = agent.policy.act(obs_chw)
-        obs, r, term, trunc, _ = env.step(ACTIONS[action_id])
+        obs, r, term, trunc, info = env.step(ACTIONS[action_id])
         total_reward += r
 
         if term or trunc:
             print("Épisode terminé – reward =", total_reward)
             total_reward = 0
             obs, info = env.reset()
-
 
 # ==========================================================
 #                          CLI
@@ -370,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--play", action="store_true")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--demos", type=int, default=20, help="Nombre de démonstrations complètes pour GAIL")
+    parser.add_argument("--epochs", type=int, default=50, help="Nombre d'époques GAIL")
 
     args = parser.parse_args()
 
@@ -385,7 +369,7 @@ if __name__ == "__main__":
 
     # GAIL
     elif args.gail and args.train:
-        train_gail(save_path=model_path, max_demos=args.demos)
+        train_gail(save_path=model_path, max_demos=args.demos, gail_epochs=args.epochs)
     elif args.gail and args.play:
         play_gail(model_path)
 
