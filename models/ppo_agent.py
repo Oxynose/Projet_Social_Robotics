@@ -1,4 +1,4 @@
-# ppo_agent.py
+# models/ppo_agent.py
 import os
 import math
 import time
@@ -11,7 +11,7 @@ from torch.distributions import Categorical
 from torch.optim import Adam
 
 
-# --- ACTIONS (même mapping que ton main.py original) ---
+# --- ACTIONS (même mapping que ton main.py) ---
 ACTIONS = {
     0: np.array([0.0, 0.0, 0.0]),   # rien
     1: np.array([-1.0, 0.0, 0.0]),  # gauche
@@ -30,19 +30,17 @@ N_ACTIONS = len(ACTIONS)
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape: Tuple[int], n_actions: int):
         super().__init__()
-        # obs is CarRacing-v3 RGB 96x96x3 by default. We'll flatten after a few conv layers.
+        # obs: (C, H, W) — now supports C=4 (RGB + speed channel)
         c, h, w = obs_shape
-        # Small conv backbone
         self.conv = nn.Sequential(
-            nn.Conv2d(c, 32, kernel_size=8, stride=4),  # -> (32, 23, 23)
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # -> (64, 10, 10)
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),  # -> (64, 8, 8)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
             nn.Flatten()
         )
-        # compute conv output size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, c, h, w)
             conv_out = self.conv(dummy).shape[1]
@@ -52,13 +50,12 @@ class ActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # policy logits and value head
         self.policy_logits = nn.Linear(512, n_actions)
         self.value_head = nn.Linear(512, 1)
 
     def forward(self, x):
-        # expects x shape: (B, C, H, W), values in [0,255] or normalized floats
-        x = x / 255.0  # normalize if input is uint8 images
+        # x shape: (B, C, H, W)
+        x = x / 255.0
         features = self.conv(x)
         features = self.fc(features)
         logits = self.policy_logits(features)
@@ -92,7 +89,7 @@ class PPOAgent:
         self.max_grad_norm = max_grad_norm
 
     def act(self, obs: np.ndarray):
-        """Return action_id (int), logprob, value"""
+        """Return action_id (int), logprob (float), value (float)"""
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1,C,H,W)
         with torch.no_grad():
             logits, value = self.net(obs_t)
@@ -109,22 +106,31 @@ class PPOAgent:
         return values, logprobs, entropy
 
     def compute_gae(self, rewards, dones, values, last_value):
-        """Compute GAE advantages and returns. numpy inputs."""
-        advs = np.zeros_like(rewards)
-        lastgaelam = 0
-        # iterate reversed
-        for t in reversed(range(len(rewards))):
+        """
+        Compute GAE advantages and returns.
+        Inputs are numpy arrays:
+          rewards: (T,)
+          dones: (T,) mask (1.0 if done else 0.0)
+          values: (T,) or (T+1,) depending on caller (we expect values length == T)
+          last_value: scalar bootstrap value for the value at T
+        Returns:
+          advantages (np.array shape (T,)), returns (np.array shape (T,))
+        """
+        T = len(rewards)
+        advs = np.zeros(T, dtype=np.float32)
+        lastgaelam = 0.0
+        for t in reversed(range(T)):
             nonterminal = 1.0 - dones[t]
-            next_val = values[t + 1] if t + 1 < len(values) else last_value
+            next_val = values[t + 1] if (t + 1 < len(values)) else last_value
             delta = rewards[t] + self.gamma * next_val * nonterminal - values[t]
-            advs[t] = lastgaelam = delta + self.gamma * self.lam * nonterminal * lastgaelam
+            lastgaelam = delta + self.gamma * self.lam * nonterminal * lastgaelam
+            advs[t] = lastgaelam
         returns = advs + values
         return advs, returns
 
     def update(self, batch_obs, batch_actions, batch_logprobs, batch_returns, batch_advantages,
                epochs=4, minibatch_size=64):
         """Perform PPO update on collected rollout buffer."""
-        # convert to torch tensors
         obs = torch.tensor(batch_obs, dtype=torch.float32, device=self.device)
         actions = torch.tensor(batch_actions, dtype=torch.long, device=self.device)
         old_logprobs = torch.tensor(batch_logprobs, dtype=torch.float32, device=self.device)
@@ -133,8 +139,8 @@ class PPOAgent:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         n = obs.shape[0]
+        last_loss = 0.0
         for epoch in range(epochs):
-            # generate random minibatches
             indices = np.arange(n)
             np.random.shuffle(indices)
             for start in range(0, n, minibatch_size):
@@ -146,21 +152,19 @@ class PPOAgent:
                 mb_adv = advantages[mb_idx]
 
                 values, logprobs, entropy = self.get_values_and_logprobs(mb_obs, mb_actions)
-                # policy loss
                 ratio = torch.exp(logprobs - mb_oldlog)
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_coef, 1.0 + self.clip_coef) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
-                # value loss (MSE)
                 value_loss = ((values - mb_returns) ** 2).mean()
-                # total loss
                 loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
                 self.optimizer.step()
-        return loss.item()
+                last_loss = loss.item()
+        return last_loss
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
